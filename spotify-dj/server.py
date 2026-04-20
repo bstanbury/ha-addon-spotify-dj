@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Spotify Smart DJ — HA Add-on
-Adaptive music based on time, weather, mood, and listening patterns.
+"""Spotify Smart DJ v1.0.0 — HA Add-on
+Adaptive music with learning, weather awareness, mood modes, and kid-friendly mode.
 
 Endpoints:
   GET  /health              — Health check
-  GET  /recommend           — Get recommended playlist for now
-  POST /play                — Play recommended playlist on Sonos
+  GET  /recommend           — Get recommendation without playing
+  POST /play                — Play recommended (auto time/weather/mood)
   POST /play/<playlist_id>  — Play specific playlist
-  GET  /playlists           — Browse playlist library by slot/mood
-  GET  /search/<query>      — Search Spotify playlists
+  POST /mood/<mood>         — Play by mood
+  POST /kids                — Kid-friendly mode (Cooper visiting)
+  POST /kids/off            — Exit kid mode
+  GET  /playlists           — Browse full playlist library
+  GET  /search/<query>      — Search Spotify
   GET  /now-playing         — Current Sonos state
-  POST /mood/<mood>         — Play by mood (chill/energetic/focus/party/sleep/romantic/rainy/sunny)
+  POST /like                — Thumbs up current playlist (learning)
+  POST /skip                — Skip/dislike current (learning)
+  GET  /stats               — Listening stats and preferences
+  POST /volume/<level>      — Set volume (0-100)
+  POST /speaker/<entity>    — Switch target speaker
 """
-import os, json, time, logging, random, base64
+import os, json, time, logging, random, base64, threading
+from datetime import datetime
 from flask import Flask, jsonify, request
 import requests as http
 
@@ -30,6 +38,27 @@ logger = logging.getLogger('spotify-dj')
 spotify_token = None
 token_expires = 0
 recent = []
+kids_mode = False
+current_playlist_id = None
+DATA_FILE = '/data/dj_stats.json'
+
+# Learning data
+stats = {'likes': {}, 'skips': {}, 'plays': {}, 'total_plays': 0}
+
+def load_stats():
+    global stats
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE) as f:
+                stats = json.load(f)
+            logger.info(f'Loaded DJ stats: {stats["total_plays"]} plays')
+    except: pass
+
+def save_stats():
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(stats, f, indent=2)
+    except: pass
 
 LIB = {
     'morning_early': [
@@ -67,6 +96,10 @@ LIB = {
     'romantic':   [{'id':'37i9dQZF1DX6VdMW310YC7','name':'Chill R&B'},{'id':'37i9dQZF1DWVqJMsgEN0F4','name':'Acoustic Evening'}],
     'rainy':      [{'id':'37i9dQZF1DX1n9whBbBKoL','name':'Lo-fi Cafe'},{'id':'37i9dQZF1DX3Ogo9pFvBkY','name':'Ambient'}],
     'sunny':      [{'id':'37i9dQZF1DX4OzrY981I1W','name':'Indie Folk'},{'id':'37i9dQZF1DX6ziVCJnEm59','name':'Morning Motivation'}],
+    'kids':       [{'id':'37i9dQZF1DX6aTaZa0K6VA','name':'Disney Hits'},{'id':'37i9dQZF1DWVlYsZJXBFMo','name':'Kids Pop'},{'id':'37i9dQZF1DX2M1RktxUUHE','name':'Family Road Trip'},{'id':'37i9dQZF1DXa8NOEUWPn9W','name':'Happy Hits'}],
+    'dinner':     [{'id':'37i9dQZF1DX4xuWVBs4FgJ','name':'Dinner Jazz'},{'id':'37i9dQZF1DWVqJMsgEN0F4','name':'Acoustic Evening'}],
+    'workout':    [{'id':'37i9dQZF1DX76Wlfdnj7AP','name':'Beast Mode'},{'id':'37i9dQZF1DX0BcQWzuB7ZO','name':'Dance Hits'}],
+    'morning_coffee': [{'id':'37i9dQZF1DX1n9whBbBKoL','name':'Lo-fi Cafe'},{'id':'37i9dQZF1DWXe9gFZP0gtP','name':'Chill Morning'}],
 }
 
 def sp_token():
@@ -82,7 +115,6 @@ def sp_token():
     return None
 
 def time_slot():
-    from datetime import datetime
     h = datetime.now().hour
     if 6<=h<9: return 'morning_early'
     if 9<=h<12: return 'morning_late'
@@ -90,26 +122,57 @@ def time_slot():
     if 17<=h<21: return 'evening'
     return 'night'
 
-def weather():
+def get_weather():
     try:
         r = http.get(f'{HA_URL}/api/states/weather.forecast_home', headers={'Authorization':f'Bearer {HA_TOKEN}'}, timeout=5)
         if r.status_code == 200: return r.json()['state']
     except: pass
     return 'unknown'
 
+def score_playlist(p):
+    """Score a playlist based on learning data. Higher = more preferred."""
+    pid = p['id']
+    likes = stats['likes'].get(pid, 0)
+    skips = stats['skips'].get(pid, 0)
+    plays = stats['plays'].get(pid, 0)
+    return likes * 3 - skips * 2 + plays * 0.5
+
 def pick(slot=None, mood=None):
-    global recent
-    w = weather()
+    global recent, current_playlist_id
+    if kids_mode: mood = 'kids'
+    w = get_weather()
     if mood and mood in LIB: cands = LIB[mood]
     elif w in ['rainy','pouring']: cands = LIB.get('rainy', LIB.get(slot or time_slot(), []))
     elif w in ['sunny','clear-night','partlycloudy'] and time_slot() in ['morning_late','afternoon']: cands = LIB.get('sunny', LIB.get(slot or time_slot(), []))
     else: cands = LIB.get(slot or time_slot(), [])
     if not cands: cands = LIB['afternoon']
+    # Avoid recent
     avail = [p for p in cands if p['id'] not in recent[-3:]]
     if not avail: avail = cands
-    p = random.choice(avail)
+    # Score by learning
+    if stats['total_plays'] > 5:
+        avail.sort(key=score_playlist, reverse=True)
+        # Weighted random: prefer top-scored but allow variety
+        weights = [max(1, score_playlist(p) + 5) for p in avail]
+        total = sum(weights)
+        r = random.random() * total
+        cumul = 0
+        for i, w in enumerate(weights):
+            cumul += w
+            if r <= cumul:
+                p = avail[i]
+                break
+        else:
+            p = avail[0]
+    else:
+        p = random.choice(avail)
     recent.append(p['id'])
     recent = recent[-10:]
+    current_playlist_id = p['id']
+    # Track play
+    stats['plays'][p['id']] = stats['plays'].get(p['id'], 0) + 1
+    stats['total_plays'] += 1
+    save_stats()
     return p
 
 def play_sonos(pid, vol=None):
@@ -119,6 +182,7 @@ def play_sonos(pid, vol=None):
     time.sleep(1)
     if vol is None:
         vol = {'morning_early':0.12,'morning_late':0.15,'afternoon':0.16,'evening':0.14,'night':0.10}.get(time_slot(), 0.14)
+        if kids_mode: vol = min(vol + 0.05, 0.25)  # Slightly louder for kids
     http.post(f'{HA_URL}/api/services/media_player/volume_set', headers=hh, json={'entity_id':SONOS,'volume_level':vol}, timeout=5)
     http.post(f'{HA_URL}/api/services/media_player/play_media', headers=hh, json={'entity_id':SONOS,'media_content_id':f'spotify:playlist:{pid}','media_content_type':'playlist'}, timeout=5)
     time.sleep(1)
@@ -126,34 +190,100 @@ def play_sonos(pid, vol=None):
 
 @app.route('/')
 def index():
-    return jsonify({'name':'Spotify Smart DJ','version':'0.1.0','slot':time_slot(),'weather':weather(),'moods':['chill','energetic','focus','party','sleep','romantic','rainy','sunny']})
+    moods = [k for k in LIB if k not in ['morning_early','morning_late','afternoon','evening','night']]
+    return jsonify({'name':'Spotify Smart DJ','version':'1.0.0','slot':time_slot(),'weather':get_weather(),'kids_mode':kids_mode,'moods':moods,'total_plays':stats['total_plays']})
 
 @app.route('/health')
 def health():
-    return jsonify({'status':'ok' if sp_token() else 'auth_failed','slot':time_slot()})
+    return jsonify({'status':'ok' if sp_token() else 'auth_failed','slot':time_slot(),'kids_mode':kids_mode})
 
 @app.route('/recommend')
 def recommend():
     p = pick(mood=request.args.get('mood'))
-    return jsonify({'id':p['id'],'name':p.get('name','?'),'vibe':p.get('vibe',''),'slot':time_slot(),'weather':weather(),'url':f'https://open.spotify.com/playlist/{p["id"]}'})
+    return jsonify({'id':p['id'],'name':p.get('name','?'),'vibe':p.get('vibe',''),'slot':time_slot(),'weather':get_weather(),'score':round(score_playlist(p),1)})
 
 @app.route('/play', methods=['POST','GET'])
 def play():
     p = pick(mood=request.args.get('mood'))
     play_sonos(p['id'])
-    return jsonify({'success':True,'playing':p.get('name',p['id']),'vibe':p.get('vibe',''),'slot':time_slot(),'weather':weather()})
+    return jsonify({'success':True,'playing':p.get('name',p['id']),'vibe':p.get('vibe',''),'slot':time_slot(),'weather':get_weather(),'kids_mode':kids_mode})
 
 @app.route('/play/<pid>', methods=['POST','GET'])
 def play_id(pid):
+    global current_playlist_id
     play_sonos(pid)
+    current_playlist_id = pid
     return jsonify({'success':True,'playing':pid})
 
 @app.route('/mood/<mood>', methods=['POST','GET'])
 def mood_play(mood):
-    if mood not in LIB: return jsonify({'error':f'Unknown mood. Try: {[k for k in LIB if k not in ["morning_early","morning_late","afternoon","evening","night"]]}'}),400
+    if mood not in LIB:
+        return jsonify({'error':f'Unknown. Try: {[k for k in LIB if k not in ["morning_early","morning_late","afternoon","evening","night"]]}'}),400
     p = pick(mood=mood)
     play_sonos(p['id'])
     return jsonify({'success':True,'mood':mood,'playing':p.get('name',p['id']),'vibe':p.get('vibe','')})
+
+@app.route('/kids', methods=['POST','GET'])
+def kids_on():
+    global kids_mode
+    kids_mode = True
+    p = pick(mood='kids')
+    play_sonos(p['id'])
+    return jsonify({'success':True,'kids_mode':True,'playing':p.get('name',p['id'])})
+
+@app.route('/kids/off', methods=['POST','GET'])
+def kids_off():
+    global kids_mode
+    kids_mode = False
+    p = pick()
+    play_sonos(p['id'])
+    return jsonify({'success':True,'kids_mode':False,'playing':p.get('name',p['id'])})
+
+@app.route('/like', methods=['POST','GET'])
+def like():
+    if current_playlist_id:
+        stats['likes'][current_playlist_id] = stats['likes'].get(current_playlist_id, 0) + 1
+        save_stats()
+        return jsonify({'success':True,'liked':current_playlist_id,'total_likes':stats['likes'][current_playlist_id]})
+    return jsonify({'error':'Nothing playing'}),400
+
+@app.route('/skip', methods=['POST','GET'])
+def skip():
+    if current_playlist_id:
+        stats['skips'][current_playlist_id] = stats['skips'].get(current_playlist_id, 0) + 1
+        save_stats()
+        # Play something different
+        p = pick()
+        play_sonos(p['id'])
+        return jsonify({'success':True,'skipped':current_playlist_id,'now_playing':p.get('name',p['id'])})
+    return jsonify({'error':'Nothing playing'}),400
+
+@app.route('/stats')
+def get_stats():
+    # Build top playlists by score
+    all_ids = set(list(stats['plays'].keys()) + list(stats['likes'].keys()))
+    scored = []
+    for pid in all_ids:
+        name = '?'
+        for cat in LIB.values():
+            for p in cat:
+                if p['id'] == pid: name = p.get('name', pid); break
+        scored.append({'id':pid,'name':name,'plays':stats['plays'].get(pid,0),'likes':stats['likes'].get(pid,0),'skips':stats['skips'].get(pid,0),'score':round(stats['likes'].get(pid,0)*3 - stats['skips'].get(pid,0)*2 + stats['plays'].get(pid,0)*0.5, 1)})
+    scored.sort(key=lambda x: x['score'], reverse=True)
+    return jsonify({'total_plays':stats['total_plays'],'top_playlists':scored[:10],'kids_mode':kids_mode})
+
+@app.route('/volume/<int:level>', methods=['POST','GET'])
+def volume(level):
+    vol = max(0, min(100, level)) / 100
+    hh = {'Authorization':f'Bearer {HA_TOKEN}','Content-Type':'application/json'}
+    http.post(f'{HA_URL}/api/services/media_player/volume_set', headers=hh, json={'entity_id':SONOS,'volume_level':vol}, timeout=5)
+    return jsonify({'success':True,'volume':vol})
+
+@app.route('/speaker/<entity>', methods=['POST','GET'])
+def switch_speaker(entity):
+    global SONOS
+    SONOS = entity
+    return jsonify({'success':True,'speaker':SONOS})
 
 @app.route('/playlists')
 def playlists():
@@ -165,8 +295,8 @@ def search(query):
     if not t: return jsonify({'error':'auth failed'}),500
     r = http.get('https://api.spotify.com/v1/search', headers={'Authorization':f'Bearer {t}'}, params={'q':query,'type':'playlist','limit':5}, timeout=5)
     if r.status_code == 200:
-        return jsonify([{'id':p['id'],'name':p['name'],'tracks':p.get('tracks',{}).get('total','?'),'owner':p.get('owner',{}).get('display_name','?')} for p in r.json().get('playlists',{}).get('items',[])])
-    return jsonify({'error':'search failed'}),500
+        return jsonify([{'id':p['id'],'name':p['name'],'tracks':p.get('tracks',{}).get('total','?')} for p in r.json().get('playlists',{}).get('items',[])])
+    return jsonify({'error':'failed'}),500
 
 @app.route('/now-playing')
 def now_playing():
@@ -174,12 +304,13 @@ def now_playing():
         r = http.get(f'{HA_URL}/api/states/{SONOS}', headers={'Authorization':f'Bearer {HA_TOKEN}'}, timeout=5)
         if r.status_code == 200:
             d = r.json()
-            return jsonify({'state':d['state'],'title':d['attributes'].get('media_title'),'artist':d['attributes'].get('media_artist'),'volume':d['attributes'].get('volume_level'),'source':d['attributes'].get('source')})
+            return jsonify({'state':d['state'],'title':d['attributes'].get('media_title'),'artist':d['attributes'].get('media_artist'),'volume':d['attributes'].get('volume_level'),'source':d['attributes'].get('source'),'kids_mode':kids_mode})
     except: pass
     return jsonify({'error':'failed'}),500
 
 if __name__ == '__main__':
-    logger.info(f'Spotify Smart DJ v0.1.0 on port {API_PORT}')
+    logger.info(f'Spotify Smart DJ v1.0.0 on port {API_PORT}')
     logger.info(f'Sonos: {SONOS}')
+    load_stats()
     logger.info(f'Spotify auth: {"OK" if sp_token() else "FAILED"}')
     app.run(host='0.0.0.0', port=API_PORT, debug=False)
