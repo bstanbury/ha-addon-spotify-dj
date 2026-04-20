@@ -1,0 +1,30 @@
+{
+  "name": "Spotify Smart DJ",
+  "version": "0.1.0",
+  "slug": "spotify_dj",
+  "description": "Adaptive music — picks playlists by time, weather, mood.",
+  "url": "https://github.com/bstanbury/ha-addon-spotify-dj",
+  "arch": ["aarch64", "amd64", "armhf", "armv7", "i386"],
+  "startup": "application",
+  "boot": "auto",
+  "init": false,
+  "host_network": true,
+  "options": {
+    "client_id": "",
+    "client_secret": "",
+    "ha_url": "http://localhost:8123",
+    "ha_token": "",
+    "api_port": 8097,
+    "sonos_entity": "media_player.living_room"
+  },
+  "schema": {
+    "client_id": "str",
+    "client_secret": "str",
+    "ha_url": "str",
+    "ha_token": "str",
+    "api_port": "int",
+    "sonos_entity": "str"
+  },
+  "ingress": false,
+  "panel_icon": "mdi:music-note"
+}
