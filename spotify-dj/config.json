@@ -2,7 +2,7 @@
   "name": "Spotify Smart DJ",
   "version": "3.0.0",
   "slug": "spotify_dj",
-  "description": "Event-driven adaptive music — reacts to TV, weather, presence, and lighting. Bedroom protection, Cooper mode, confirmed playlists.",
+  "description": "Event-driven adaptive music — reacts to TV, weather, presence, and lighting in real-time.",
   "url": "https://github.com/bstanbury/ha-addon-spotify-dj",
   "arch": ["aarch64", "amd64", "armhf", "armv7", "i386"],
   "startup": "application",
